@@ -46,6 +46,11 @@ class SmartConnectionsDatabase:
         if not self.multi_path.exists():
             return
 
+        # bge-micro-v2 produces 384-d vectors. Track first valid dim,
+        # reject vectors that don't match (catches half-written ajson during re-embed races).
+        expected_dim = None
+        skipped_bad_vec = 0
+
         count = 0
         for ajson_file in self.multi_path.glob("*.ajson"):
             try:
@@ -66,23 +71,61 @@ class SmartConnectionsDatabase:
 
                     for key, item in data.items():
                         if 'embeddings' in item and 'TaylorAI/bge-micro-v2' in item['embeddings']:
-                            vec = item['embeddings']['TaylorAI/bge-micro-v2']['vec']
+                            vec = item['embeddings']['TaylorAI/bge-micro-v2'].get('vec')
+
+                            # Validate: must be a non-empty list of numbers, dim >= 2.
+                            # Smart-Connections writes ajson incrementally — during
+                            # re-embed races we may see empty/scalar/partial vec.
+                            # A bad vec downstream raises numpy "only length-1 arrays
+                            # can be converted to Python scalars" in np.dot.
+                            if not isinstance(vec, list) or len(vec) < 2:
+                                skipped_bad_vec += 1
+                                continue
+
+                            arr = np.array(vec, dtype=np.float32)
+                            if arr.ndim != 1 or not np.isfinite(arr).all():
+                                skipped_bad_vec += 1
+                                continue
+
+                            if expected_dim is None:
+                                expected_dim = arr.size
+                            elif arr.size != expected_dim:
+                                skipped_bad_vec += 1
+                                continue
+
+                            # Reject zero-norm vectors (would produce NaN on normalize).
+                            if float(np.linalg.norm(arr)) == 0.0:
+                                skipped_bad_vec += 1
+                                continue
+
+                            # smart_blocks entries lack a 'path' field; derive it from the key
+                            # (format: "smart_blocks:<path>#<heading>...").
+                            path = item.get('path')
+                            if not path and ':' in key:
+                                path = key.split(':', 1)[1].split('#', 1)[0]
 
                             # Store in cache
                             self.embeddings_cache[key] = {
-                                'path': item.get('path'),
-                                'vector': np.array(vec, dtype=np.float32),
+                                'path': path,
+                                'vector': arr,
                                 'text': item.get('text', ''),
                                 'key': key,
                                 'lines': item.get('lines', []),
                                 'metadata': item.get('metadata', {})
                             }
                             count += 1
-            except Exception as e:
+            except Exception:
                 # Skip malformed files
                 continue
 
         self.embeddings_loaded = True
+        if skipped_bad_vec:
+            import sys
+            print(
+                f"[smart-connections-mcp] skipped {skipped_bad_vec} entries "
+                f"with malformed/partial vectors (expected_dim={expected_dim})",
+                file=sys.stderr,
+            )
 
     def semantic_search(self, query: str, limit: int = 10, min_similarity: float = 0.3) -> List[Dict]:
         """
