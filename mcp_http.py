@@ -20,6 +20,22 @@ Env (read from .env):
   MCP_HTTP_PORT         optional, default 5179
 """
 import os
+import sys
+
+# pythonw.exe (boot autostart) has no console: sys.stdout/sys.stderr are None,
+# so the first print()/logging write (server.py init, uvicorn, rich) raises
+# AttributeError and kills the process before the port binds. Redirect None
+# streams to a logfile so pythonw behaves like a console run.
+if sys.stdout is None or sys.stderr is None:
+    _log = open(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_http.log"),
+        "a", buffering=1, encoding="utf-8",
+    )
+    if sys.stdout is None:
+        sys.stdout = _log
+    if sys.stderr is None:
+        sys.stderr = _log
+
 from pathlib import Path
 
 from dotenv import load_dotenv
